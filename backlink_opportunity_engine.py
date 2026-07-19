@@ -2,6 +2,7 @@
 import os
 import sqlite3
 import datetime
+import json   # <--- 新增这行
 from urllib.parse import urlparse
 
 try:
@@ -44,28 +45,105 @@ def get_traffic_score(traffic):
     else: return 20
 
 # ==========================================
-# 第二阶段：URL 意图自动识别 (Link Type)
+# 第二阶段：URL 意图自动识别 (Link Type - 企业级规则引擎)
 # ==========================================
-def guess_link_type(urls):
-    guest_patterns = ['write-for-us', 'guest-post', 'contribute', 'submit', 'guest-blogger', 'write-for-me']
-    listicle_patterns = ['best-', 'top-', '-tools', '-suppliers', 'top-10', 'top-20']
-    comparison_patterns = ['-vs-', '-alternative', 'compare-', '-competitors']
-    resource_patterns = ['resources', 'useful-links', 'links']
-    forum_patterns = ['forum', 'thread', 'question', 'community']
+def guess_link_type(domain, urls):
+    domain_lower = str(domain).lower()
     
+    # ---------------------------------------------------------
+    # 1. 强指纹库 (Domain Fingerprint) - 权重最高，一锤定音
+    # ---------------------------------------------------------
+    DOMAIN_PATTERNS = {
+        "App Market (应用市场/生态插件)": [
+            "apps.shopify.com", "appstore.com", "apps.apple.com", "play.google.com", 
+            "wordpress.org", "wordpress.com/plugins", "woocommerce.com/products", 
+            "marketplace.visualstudio.com", "chrome.google.com/webstore", "addons.mozilla.org", 
+            "apps.microsoft.com", "zapier.com/apps", "make.com/apps", "slack.com/apps", 
+            "salesforce.com/appexchange", "hubspot.com/products/marketplace", "canva.com/apps", 
+            "figma.com/community", "atlassian.com/software/marketplace"
+        ],
+        "Social / Video (视频社媒)": [
+            "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "tiktok.com", 
+            "instagram.com", "pinterest.com", "facebook.com", "twitter.com", "x.com", 
+            "threads.net", "snapchat.com", "reddit.com", "linkedin.com", "tumblr.com", 
+            "flickr.com", "behance.net", "dribbble.com"
+        ],
+        "Directory / Review (企业目录评价)": [
+            "g2.com", "capterra.com", "trustpilot.com", "saashub.com", "sourceforge.net", 
+            "producthunt.com", "getapp.com", "softwareadvice.com", "alternativeto.net", 
+            "slashdot.org", "crunchbase.com", "owler.com", "clutch.co", "goodfirms.co", 
+            "designrush.com", "serchen.com", "financesonline.com", "trustradius.com", 
+            "storeleads.app", "builtwith.com", "wappalyzer.com"
+        ],
+        "Business Directory (商业黄页)": [
+            "yelp.com", "yellowpages.com", "bbb.org", "hotfrog.com", "foursquare.com", 
+            "manta.com", "brownbook.net", "kompass.com", "business.com", "merchantcircle.com", 
+            "citysearch.com", "mapquest.com"
+        ],
+        "Forum / Community (论坛社区)": [
+            "stackexchange.com", "stackoverflow.com", "medium.com", "dev.to", 
+            "hashnode.com", "indiehackers.com", "warriorforum.com", "blackhatworld.com", 
+            "digitalpoint.com", "sitepoint.com", "moz.com/community", "community.shopify.com"
+        ],
+        "Ecommerce Marketplace (电商平台)": [
+            "amazon.com", "ebay.com", "etsy.com", "walmart.com", "aliexpress.com", 
+            "alibaba.com", "temu.com", "rakuten.com", "shopify.com", "woocommerce.com", 
+            "bigcommerce.com", "magento.com"
+        ],
+        "Coupon Deal Site (优惠券)": [
+            "coupon", "coupons", "deal", "deals", "discount", "promo", "voucher", 
+            "cashback", "retailmenot", "slickdeals", "couponfollow", "dealspotr"
+        ],
+        "News Media (新闻媒体)": [
+            "forbes.com", "entrepreneur.com", "businessinsider.com", "techcrunch.com", 
+            "venturebeat.com", "mashable.com", "theverge.com", "wired.com", "huffpost.com", "substack.com"
+        ],
+        "Education Resource (教育资源)": [
+            "edu", "coursera.org", "udemy.com", "edx.org", "skillshare.com", "khanacademy.org", "codecademy.com"
+        ],
+        "Affiliate Review (联盟测评)": [
+            "review", "reviews", "best", "top", "compare", "versus", "alternative", "guide", "buyer"
+        ]
+    }
+
+    for category, patterns in DOMAIN_PATTERNS.items():
+        for p in patterns:
+            # 如果指纹包含 "." (比如 x.com, apps.shopify.com)，说明是具体域名
+            if "." in p:
+                # 必须完全相等 (wix.com != x.com) 或者是它的子域名 (www.x.com)
+                if domain_lower == p or domain_lower.endswith('.' + p):
+                    return category
+            # 如果指纹不包含 "." (比如 coupon, review)，说明是关键词，允许包含匹配
+            else:
+                if p in domain_lower:
+                    return category
+
+    # ---------------------------------------------------------
+    # 2. URL 路径意图 (URL Path Intent) - 权重第二，判断具体页面
+    # ---------------------------------------------------------
+    URL_PATTERNS = {
+        "Guest Post": ["write-for-us", "writeforus", "guest-post", "guestpost", "guest-blog", "guestblog", "contribute", "become-author", "submit-article", "submit-post", "author-guidelines", "editorial-guidelines"],
+        "Resource Page": ["/resources/", "/resource/", "/library/", "/tools/", "/downloads/", "/free-tools/", "/knowledge-base/", "/learning/", "/academy/", "/guide/", "/guides/", "/references/"],
+        "Listicle (合集列表)": ["best-", "top-", "top10", "top-10", "top20", "top-20", "best-tools", "best-software", "best-platforms", "best-companies", "recommended", "alternatives"],
+        "Comparison": ["-vs-", "vs", "compare", "comparison", "alternative", "alternatives", "competitor", "competitors", "difference-between"],
+        "Partner / Integration": ["/partner", "/partners", "/integration", "/integrations", "/apps/", "/marketplace/", "/solutions/", "/technology-partners"],
+        "Profile Page": ["/author/", "/user/", "/profile/", "/member/", "/account/", "/contributors/", "/team/"],
+        "Forum Thread": ["/forum/", "/thread/", "/topic/", "/discussion/", "/question/", "/answers/", "/community/"],
+        "Blog Article": ["/blog/", "/news/", "/article/", "/post/", "/insights/", "/stories/", "/updates/"],
+        "Review Page": ["/review/", "/reviews/", "/rating/", "/testimonial/", "/customer-story/", "/case-study/"],
+        "Coupon": ["/coupon/", "/coupons/", "/discount/", "/promo/", "/deal/", "/offers/"],
+        "Directory Listing": ["/directory/", "/listing/", "/companies/", "/vendors/", "/suppliers/", "/software/", "/products/"]
+    }
+
     for url in urls:
         url_lower = str(url).lower()
-        for p in guest_patterns:
-            if p in url_lower: return "Guest Post (客座博客)"
-        for p in comparison_patterns:
-            if p in url_lower: return "Comparison (竞品对比)"
-        for p in listicle_patterns:
-            if p in url_lower: return "Listicle (合集/清单)"
-        for p in resource_patterns:
-            if p in url_lower: return "Resource Page (资源页)"
-        for p in forum_patterns:
-            if p in url_lower: return "Forum / Q&A (论坛问答)"
-            
+        for category, patterns in URL_PATTERNS.items():
+            if any(p in url_lower for p in patterns):
+                return category
+
+    # ---------------------------------------------------------
+    # 3. 兜底策略
+    # ---------------------------------------------------------
     return "General / Blog (常规博客/其他)"
 
 def generate_execution_queue():
@@ -81,7 +159,7 @@ def generate_execution_queue():
     
     print("[进程] 正在从情报数据库中抽取数据...")
     cur.execute('''
-        SELECT competitor_domain, ref_domain, ref_url, domain_rating, page_traffic, is_dofollow, is_spam, links_in_group 
+        SELECT competitor_domain, ref_domain, ref_url, domain_rating, page_traffic, is_dofollow, is_spam, links_in_group, target_url, raw_data 
         FROM backlinks 
     ''')
     rows = cur.fetchall()
@@ -90,7 +168,7 @@ def generate_execution_queue():
     domain_stats = {}
     
     for row in rows:
-        comp, ref_d, ref_u, dr, traf, is_dof, is_spam, links_in_group = row
+        comp, ref_d, ref_u, dr, traf, is_dof, is_spam, links_in_group, tgt_u, raw_data = row  # <--- 多解包出 tgt_u 和 raw_data
         
         if ref_d not in domain_stats:
             domain_stats[ref_d] = {
@@ -100,7 +178,9 @@ def generate_execution_queue():
                 'max_traffic': 0,
                 'is_dofollow': 0,
                 'is_spam': 0,
-                'total_links': 0  # <--- 新增初始值
+                'total_links': 0,
+                'comp_link_counts': {},  # <--- 新增：按竞品拆解外链数
+                'link_details': set()    # <--- 新增：存储全部链接对和锚文本
             }
             
         d = domain_stats[ref_d]
@@ -108,7 +188,21 @@ def generate_execution_queue():
         d['urls'].append(ref_u)
         d['max_dr'] = max(d['max_dr'], dr)
         d['max_traffic'] = max(d['max_traffic'], traf)
-        d['total_links'] += links_in_group # <--- 累加该域名下的真实外链总盘
+        d['total_links'] += links_in_group 
+        
+        # 新增1：记录各个竞品在这个域名下具体有多少条链接
+        d['comp_link_counts'][comp] = d['comp_link_counts'].get(comp, 0) + links_in_group
+        
+        # 新增2：解析 JSON 抓取锚文本，拼接格式
+        try:
+            raw_dict = json.loads(raw_data)
+            # Ahrefs 导出文件中的锚文本字段通常为 Link anchor 或 Anchor
+            anchor = raw_dict.get('Link anchor') or raw_dict.get('Anchor') or raw_dict.get('anchor') or "无锚文本/图片链接"
+        except:
+            anchor = "未知"
+            
+        detail_str = f"[{comp}] {ref_u} ---> {tgt_u} (锚文本: {anchor})"
+        d['link_details'].add(detail_str)
         if is_dof == 1: d['is_dofollow'] = 1
         if is_spam == 1: d['is_spam'] = 1
 
@@ -138,15 +232,29 @@ def generate_execution_queue():
         elif auto_score > 0: priority = "P3 (长尾观察)"
         else: priority = "🗑️ SPAM (直接放弃)"
         
-        # 5. 意图识别
-        link_type = guess_link_type(d['urls'])
+        # 5. 意图识别 (传入了 ref_d 域名变量)
+        link_type = guess_link_type(ref_d, d['urls'])
         
-        # 6. 行动建议
-        action_suggest = "获取邮箱并发送 Pitch"
-        if "Guest Post" in link_type: action_suggest = "撰写行业文章并提交 Guest Post"
-        elif "Listicle" in link_type: action_suggest = "联系作者请求加入 Top 10 List"
-        elif "Comparison" in link_type: action_suggest = "请求加入产品对比评测"
-        elif "Resource Page" in link_type: action_suggest = "请求将工具加入有用链接"
+        # 6. 行动建议 (配合企业级分类库，提供极具针对性的落地 SOP)
+        action_suggest = "获取邮箱并发送破冰 Pitch 邮件"  # 默认兜底
+        
+        if "App Market" in link_type: action_suggest = "技术/产品部：研发并上架对应平台的 App/插件"
+        elif "Social / Video" in link_type: action_suggest = "社媒运营：注册官方账号留链接，或联系博主商单带货"
+        elif "Directory / Review" in link_type: action_suggest = "基础运营：无需沟通，直接认领企业主页并刷几条好评"
+        elif "Business Directory" in link_type: action_suggest = "基础运营：提交企业基础信息(NAP: 名字/地址/网址)"
+        elif "Forum" in link_type or "Thread" in link_type: action_suggest = "社媒运营：注册账号，养号并参与问答(带外链)"
+        elif "Ecommerce" in link_type: action_suggest = "商务部：注册卖家/供应商账号，或寻求分销合作"
+        elif "Coupon" in link_type: action_suggest = "联盟营销：提交 Arkswift 独家折扣码给平台编辑"
+        elif "News Media" in link_type: action_suggest = "PR/公关部：撰写高质量新闻稿，联系记者或通过PR平台分发"
+        elif "Education" in link_type: action_suggest = "市场部：提供针对学生的专属方案，或提交教学案例获取 .edu 链接"
+        elif "Affiliate" in link_type or "Comparison" in link_type or "Review" in link_type: 
+            action_suggest = "联盟营销：联系站长提议加入 Arkswift 联盟计划(CPS)并请求测评"
+        elif "Guest Post" in link_type: action_suggest = "内容SEO：按对方指南(Guidelines)撰写高质量行业文章投稿"
+        elif "Resource Page" in link_type: action_suggest = "内容SEO：邮件联系编辑，请求将 Arkswift 加入该资源库"
+        elif "Listicle" in link_type: action_suggest = "内容SEO：邮件联系作者，请求将 Arkswift 补充进入 Top 榜单"
+        elif "Partner" in link_type: action_suggest = "BD/商务部：联系对方 Partner 团队，探讨 API 集成或联合营销"
+        elif "Profile" in link_type: action_suggest = "基础运营：注册免费账户，在个人 Bio/主页留下外链"
+        elif "Directory Listing" in link_type: action_suggest = "基础运营：提交工具/企业信息入驻该黄页目录"
 
         scored_domains.append({
             'priority': priority,
@@ -155,12 +263,14 @@ def generate_execution_queue():
             'link_type': link_type,
             'action': action_suggest,
             'alpha': alpha_count,
-            'total_links': d['total_links'], # <--- 加上这一行
+            # 将总外链格式化为：总计:751 (doba.com:500, bigbuy.eu:251)
+            'total_links': f"总计:{d['total_links']} (" + ", ".join([f"{k}:{v}" for k, v in d['comp_link_counts'].items()]) + ")",
             'dr': d['max_dr'],
             'traffic': d['max_traffic'],
             'dofollow': "✅ Yes" if d['is_dofollow'] else "❌ No",
             'spam': "⚠️ Yes" if d['is_spam'] else "No",
-            'example_url': d['urls'][0]
+            # 用回车符拼出所有竞品的链接和锚文本
+            'example_url': "\n\n".join(list(d['link_details'])) 
         })
 
     # 排序：优先度高 -> 分数高 -> DR高
@@ -192,7 +302,7 @@ def generate_execution_queue():
         
         # --- AI 预留处理区 (绿底) ---
         ("M", "🧠AI: 业务相关性评分(0-100)", "70AD47"),
-        ("N", "🧠AI: 推荐创作角度(Angle)", "70AD47"),
+        ("N", "🧠AI: 配套内容(如Pitch邮件/大纲)", "70AD47"),
         ("O", "🧠AI: 难度评级(Easy/Hard)", "70AD47"),
         
         # --- 人工执行区 (蓝底) ---
@@ -232,6 +342,9 @@ def generate_execution_queue():
             "", # P: 人工 难度
         ]
         ws.append(row_data)
+        # 强行让 G列(外链拆解) 和 L列(全部对标链接) 自动换行并居中，确保排版整洁
+        ws.cell(row=idx, column=7).alignment = Alignment(wrap_text=False, vertical="center")
+        ws.cell(row=idx, column=12).alignment = Alignment(wrap_text=False, vertical="center")
         
         # Q列(第17列) 注入Excel公式，列号已更新：M列是AI，P列是人工
         formula = f"=(C{idx}*0.8) + (IF(ISNUMBER(M{idx}),M{idx},0)*0.15) + (IF(ISNUMBER(P{idx}),P{idx},0)*0.05)"
@@ -245,7 +358,7 @@ def generate_execution_queue():
     # 调整列宽 (加入了新列 G)
     column_widths = {
         'A': 15, 'B': 25, 'C': 18, 'D': 25, 'E': 30, 
-        'F': 15, 'G': 25, 'H': 10, 'I': 10, 'J': 10, 'K': 10, 'L': 40,
+        'F': 15, 'G': 40, 'H': 10, 'I': 10, 'J': 10, 'K': 10, 'L': 90, # G改40，L改90
         'M': 25, 'N': 35, 'O': 20, 
         'P': 28, 'Q': 25, 'R': 25, 'S': 30, 'T': 20
     }
