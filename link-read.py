@@ -45,6 +45,7 @@ def init_db():
             is_dofollow INTEGER,
             is_spam INTEGER,
             links_in_group INTEGER DEFAULT 1,
+            is_lost INTEGER DEFAULT 0,
             raw_data TEXT,
             UNIQUE(competitor_domain, ref_domain)
         )
@@ -118,6 +119,10 @@ def process_ahrefs_exports(conn):
             try: links_in_group = int(float(lower_row.get('links in group', 1)))
             except (ValueError, TypeError): links_in_group = 1
 
+            # 🔴 新增：如果 lost 字段有内容，视为该渠道代表外链已丢失
+            is_lost = 1 if lower_row.get('lost') and str(lower_row.get('lost')).strip() != '' else 0
+
+
             page_type = lower_row.get('page type', 'Unknown')
             page_category = lower_row.get('page category', 'Unknown')
             
@@ -128,15 +133,15 @@ def process_ahrefs_exports(conn):
 
             insert_data.append((
                 competitor, ref_domain, ref_url, target_url, 
-                dr, traffic, page_type, page_category, is_dofollow, is_spam, links_in_group, raw_json
+                dr, traffic, page_type, page_category, is_dofollow, is_spam, links_in_group, is_lost, raw_json
             ))
             
         f.close()
         
         cur.executemany('''
             INSERT OR IGNORE INTO backlinks 
-            (competitor_domain, ref_domain, ref_url, target_url, domain_rating, page_traffic, page_type, page_category, is_dofollow, is_spam, links_in_group, raw_data) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (competitor_domain, ref_domain, ref_url, target_url, domain_rating, page_traffic, page_type, page_category, is_dofollow, is_spam, links_in_group, is_lost, raw_data) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', insert_data)
         
     conn.commit()
@@ -151,7 +156,7 @@ def generate_strategic_reports(conn, total_files, global_headers):
 
     print("\n[进程] 正在从数据库拉取独立域名级(Domain-level)数据...")
     cur.execute('''
-        SELECT competitor_domain, ref_domain, ref_url, target_url, domain_rating, page_traffic, page_type, page_category, raw_data, is_dofollow, is_spam, links_in_group 
+        SELECT competitor_domain, ref_domain, ref_url, target_url, domain_rating, page_traffic, page_type, page_category, raw_data, is_dofollow, is_spam, links_in_group, is_lost 
         FROM backlinks 
     ''')
     all_links = cur.fetchall()
@@ -159,15 +164,19 @@ def generate_strategic_reports(conn, total_files, global_headers):
     domain_map = {}
     comp_stats = {}  
     comp_time_stats = {}  
+    comp_time_stats_live = {}  # 🔴 增加 Live 时间字典
 
     print(f"[进程] 成功提纯 {len(all_links)} 个独立引荐域名，正在进行多维聚类计算与图表数据准备...")
 
     for row in all_links:
-        comp, ref_d, ref_u, tgt_u, dr, traf, p_type, p_cat, raw_j, is_dofollow, is_spam, links_in_group = row
+        comp, ref_d, ref_u, tgt_u, dr, traf, p_type, p_cat, raw_j, is_dofollow, is_spam, links_in_group, is_lost = row
         raw_dict = json.loads(raw_j)
 
         if comp not in comp_stats:
-            comp_stats[comp] = {'total_domains': 0, 'total_backlinks': 0, '0-20': 0, '20-40': 0, '40-60': 0, '60-80': 0, '80-100': 0, 'dofollow': 0, 'spam': 0}
+            comp_stats[comp] = {
+                'total_domains': 0, 'total_backlinks': 0, '0-20': 0, '20-40': 0, '40-60': 0, '60-80': 0, '80-100': 0, 'dofollow': 0, 'spam': 0,
+                'live_domains': 0, 'live_backlinks': 0, 'live_0-20': 0, 'live_20-40': 0, 'live_40-60': 0, 'live_60-80': 0, 'live_80-100': 0, 'live_dofollow': 0, 'live_spam': 0
+            }
         
         comp_stats[comp]['total_domains'] += 1
         comp_stats[comp]['total_backlinks'] += links_in_group # 计算总外链数
@@ -181,13 +190,30 @@ def generate_strategic_reports(conn, total_files, global_headers):
         if is_dofollow == 1: comp_stats[comp]['dofollow'] += 1
         if is_spam == 1: comp_stats[comp]['spam'] += 1
 
+        # 🔴 如果这条没丢，追加到 Live 资产里
+        if is_lost == 0:
+            comp_stats[comp]['live_domains'] += 1
+            comp_stats[comp]['live_backlinks'] += links_in_group
+            if dr <= 20: comp_stats[comp]['live_0-20'] += 1
+            elif dr <= 40: comp_stats[comp]['live_20-40'] += 1
+            elif dr <= 60: comp_stats[comp]['live_40-60'] += 1
+            elif dr <= 80: comp_stats[comp]['live_60-80'] += 1
+            else: comp_stats[comp]['live_80-100'] += 1
+            if is_dofollow == 1: comp_stats[comp]['live_dofollow'] += 1
+            if is_spam == 1: comp_stats[comp]['live_spam'] += 1
+
         first_seen = str(raw_dict.get('first seen', raw_dict.get('First seen', '')))
         year = first_seen[:4] if len(first_seen) >= 4 and first_seen[:4].isdigit() else 'Unknown'
         
         if comp not in comp_time_stats:
             comp_time_stats[comp] = {}
+        if comp not in comp_time_stats_live:
+            comp_time_stats_live[comp] = {}
+            
         if year != 'Unknown':
             comp_time_stats[comp][year] = comp_time_stats[comp].get(year, 0) + 1
+            if is_lost == 0:
+                comp_time_stats_live[comp][year] = comp_time_stats_live[comp].get(year, 0) + 1
 
         if ref_d not in domain_map:
             domain_map[ref_d] = {
@@ -203,7 +229,12 @@ def generate_strategic_reports(conn, total_files, global_headers):
         if is_spam == 0: d['is_spam'] = 0         
         if p_type and p_type != 'Unknown': d['types'].add(p_type)
         if p_cat and p_cat != 'Unknown': d['categories'].add(p_cat)
-        d['link_details'].append(f"[{comp}] {ref_u}  --->  {tgt_u}")
+        
+        # 🔥 新增：提取锚文本 (Anchor) 拼接入范例
+        anchor = str(raw_dict.get('Anchor', raw_dict.get('anchor', ''))).strip()
+        if not anchor: anchor = "无锚文本"
+        d['link_details'].append(f"[{comp}] {ref_u}  --[{anchor}]-->  {tgt_u}")
+        
         d['raw_rows'].append((comp, ref_u, tgt_u, raw_j))
 
     print("[进程] 正在按策略权重进行高质量域名智能排序...")
@@ -316,107 +347,145 @@ def generate_strategic_reports(conn, total_files, global_headers):
                 ws3.cell(row=header_row, column=col).fill = PatternFill("solid", fgColor="2F5597") 
             ws3.append([]) 
             
-            # 2. 核心高价值指标区 (融合 Links in group 新指标)
-            dof_pct = stats['dofollow'] / total_domains
-            spam_pct = stats['spam'] / total_domains
-            high_dr_pct = (stats['40-60'] + stats['60-80'] + stats['80-100']) / total_domains
-            sitewide_ratio = total_backlinks / total_domains
+            # 2. 核心高价值指标区 (融合 Live 和 流失率)
+            live_domains = stats['live_domains']
+            live_backlinks = stats['live_backlinks']
+            lost_rate = (total_domains - live_domains) / total_domains if total_domains else 0
+            live_dof_pct = stats['live_dofollow'] / live_domains if live_domains else 0
+            live_high_dr_pct = (stats['live_40-60'] + stats['live_60-80'] + stats['live_80-100']) / live_domains if live_domains else 0
             
-            ws3.append(["核心数据资产", "引荐域名总数 (广度)", "预估外链总数 (规模)", "平均单域名外链数 (Sitewide指标)", "Dofollow占比", "高权重(DR>40)占比"])
+            # 🔥 文字修改为 (Last 5 years)
+            ws3.append(["核心数据资产", "历史引荐域名总数(Last 5 years)", "历史预估外链数", "流失率(Lost %)", "现存引荐域名(Live)", "现存预估外链数(Live)", "现存Dofollow占比", "现存高权重占比"])
             metric_title_row = ws3.max_row
-            ws3.append(["", total_domains, total_backlinks, f"{sitewide_ratio:.1f}", f"{dof_pct:.1%}", f"{high_dr_pct:.1%}"])
+            ws3.append(["", total_domains, total_backlinks, f"{lost_rate:.1%}", live_domains, live_backlinks, f"{live_dof_pct:.1%}", f"{live_high_dr_pct:.1%}"])
             metric_data_row = ws3.max_row
             
-            for c in range(1, 7):
+            for c in range(1, 9):
                 ws3.cell(row=metric_title_row, column=c).font = Font(bold=True)
                 ws3.cell(row=metric_title_row, column=c).fill = PatternFill("solid", fgColor="D9E1F2")
                 ws3.cell(row=metric_title_row, column=c).alignment = Alignment(horizontal="center")
                 ws3.cell(row=metric_data_row, column=c).alignment = Alignment(horizontal="center")
             ws3.append([]) 
             
-            # 3. DR 分布数据表
+            # 3. DR 分布数据表 (🔥加入 Live 统计行)
             ws3.append(["DR 权重分布", "0-20 (极差)", "20-40 (普通)", "40-60 (优质)", "60-80 (权威)", "80-100 (顶配)"])
             dr_title_row = ws3.max_row
-            ws3.append(["域名数量", stats['0-20'], stats['20-40'], stats['40-60'], stats['60-80'], stats['80-100']])
+            ws3.append(["历史域名数量", stats['0-20'], stats['20-40'], stats['40-60'], stats['60-80'], stats['80-100']])
             dr_data_row = ws3.max_row
-            ws3.append(["占总盘比例", f"{stats['0-20']/total_domains:.1%}", f"{stats['20-40']/total_domains:.1%}", f"{stats['40-60']/total_domains:.1%}", f"{stats['60-80']/total_domains:.1%}", f"{stats['80-100']/total_domains:.1%}"])
+            ws3.append(["历史占盘比", f"{stats['0-20']/total_domains:.1%}" if total_domains else "0%", f"{stats['20-40']/total_domains:.1%}" if total_domains else "0%", f"{stats['40-60']/total_domains:.1%}" if total_domains else "0%", f"{stats['60-80']/total_domains:.1%}" if total_domains else "0%", f"{stats['80-100']/total_domains:.1%}" if total_domains else "0%"])
+            ws3.append(["Live 域名数量", stats['live_0-20'], stats['live_20-40'], stats['live_40-60'], stats['live_60-80'], stats['live_80-100']])
+            dr_live_data_row = ws3.max_row
             
             for c in range(1, 7):
                 ws3.cell(row=dr_title_row, column=c).font = Font(bold=True)
                 ws3.cell(row=dr_title_row, column=c).fill = PatternFill("solid", fgColor="F2F2F2")
                 ws3.cell(row=dr_title_row, column=c).alignment = Alignment(horizontal="center")
-                ws3.cell(row=dr_title_row+1, column=c).alignment = Alignment(horizontal="center")
-                ws3.cell(row=dr_title_row+2, column=c).alignment = Alignment(horizontal="center")
+                ws3.cell(row=dr_data_row, column=c).alignment = Alignment(horizontal="center")
+                ws3.cell(row=dr_data_row+1, column=c).alignment = Alignment(horizontal="center")
+                ws3.cell(row=dr_live_data_row, column=c).alignment = Alignment(horizontal="center")
             ws3.append([]) 
             
-            # 4. 历年增长趋势表
+            # 4. 历年增长趋势表 (分离 历史 与 Live)
             ws3.append(["年份趋势"] + all_years)
             time_title_row = ws3.max_row
             
             new_counts = [comp_time_stats[comp].get(y, 0) for y in all_years]
-            cum_counts = []
-            cumulative = 0
-            for nc in new_counts:
-                cumulative += nc
+            live_new_counts = [comp_time_stats_live[comp].get(y, 0) for y in all_years]
+            
+            cum_counts = []; cumulative = 0
+            live_cum_counts = []; cumulative_live = 0
+            for i in range(len(all_years)):
+                cumulative += new_counts[i]
                 cum_counts.append(cumulative)
+                cumulative_live += live_new_counts[i]
+                live_cum_counts.append(cumulative_live)
                 
-            ws3.append(["当年新增域名"] + new_counts)
+            ws3.append(["(历史)当年新增"] + new_counts)
             time_new_row = ws3.max_row
-            ws3.append(["累加总域名盘"] + cum_counts)
+            ws3.append(["(历史)累加总盘"] + cum_counts)
             time_cum_row = ws3.max_row
             
-            for c in range(1, len(all_years)+2):
-                ws3.cell(row=time_title_row, column=c).font = Font(bold=True)
-                ws3.cell(row=time_title_row, column=c).fill = PatternFill("solid", fgColor="F2F2F2")
-                ws3.cell(row=time_title_row, column=c).alignment = Alignment(horizontal="center")
-                ws3.cell(row=time_new_row, column=c).alignment = Alignment(horizontal="center")
-                ws3.cell(row=time_cum_row, column=c).alignment = Alignment(horizontal="center")
+            ws3.append(["(Live)当年新增"] + live_new_counts)
+            time_new_live_row = ws3.max_row
+            ws3.append(["(Live)累加现存"] + live_cum_counts)
+            time_cum_live_row = ws3.max_row
+            
+            for r in [time_title_row, time_new_row, time_cum_row, time_new_live_row, time_cum_live_row]:
+                for c in range(1, len(all_years)+2):
+                    if r == time_title_row:
+                        ws3.cell(row=r, column=c).font = Font(bold=True)
+                        ws3.cell(row=r, column=c).fill = PatternFill("solid", fgColor="F2F2F2")
+                    ws3.cell(row=r, column=c).alignment = Alignment(horizontal="center")
             ws3.append([]) 
             
-            # --- 紧凑排版：图表紧贴表格并列放置 ---
-            # 缩减空白，仅下移 1 行紧贴数据表
+            # --- 🔥 生成 4 张精美图表 (历史 2 张，Live 2 张) ---
             chart_anchor_row = ws3.max_row + 1
-            
-            line = LineChart()
-            line.title = f"[{comp}] - 独立引荐域名增长趋势"
-            line.style = 13 
-            line.x_axis.title = "年份"
-            line.y_axis.title = "域名数量 (个)"
-            line_data = Reference(ws3, min_col=1, min_row=time_new_row, max_col=len(all_years)+1, max_row=time_cum_row)
-            line_cats = Reference(ws3, min_col=2, min_row=time_title_row, max_col=len(all_years)+1, max_row=time_title_row)
-            line.add_data(line_data, from_rows=True, titles_from_data=True)
-            line.set_categories(line_cats)
-            line.width = 15; line.height = 7.5 # 调整为修长舒适的比例
-            
-            pie = PieChart()
-            pie.title = f"[{comp}] - DR 权重资产分布"
-            pie.style = 26 
-            pie_labels = Reference(ws3, min_col=2, min_row=dr_title_row, max_col=6, max_row=dr_title_row)
-            pie_data = Reference(ws3, min_col=2, min_row=dr_data_row, max_col=6, max_row=dr_data_row)
-            pie.add_data(pie_data, from_rows=True, titles_from_data=False)
-            pie.set_categories(pie_labels)
-            
-            pie.dataLabels = DataLabelList()
-            pie.dataLabels.showPercent = True
-            pie.dataLabels.showVal = False
-            pie.dataLabels.showSerName = False
-            try: pie.dataLabels.position = "outEnd" 
-            except: pass
-            pie.width = 12; pie.height = 7.5 # 与曲线图等高，视觉对齐
-            
             sw_colors = ["294266", "F7941D", "20B799", "FDB913", "3FBBDF", "8C67AB", "E5625E", "8391A5"]
-            for i, s in enumerate(line.series):
-                try:
-                    s.graphicalProperties.line.solidFill = sw_colors[i % len(sw_colors)]
-                    s.graphicalProperties.line.width = 30000
-                except: pass
-
-            # A列放曲线，I列放饼图，中间不留巨大空隙
-            ws3.add_chart(line, f"A{chart_anchor_row}")
-            ws3.add_chart(pie, f"I{chart_anchor_row}")
             
-            # 将底部空行缩减为 15 行，刚好容纳图表高度，让下一个竞品紧密衔接
-            for _ in range(15):
+            # (1) 历史折线图
+            line_hist = LineChart()
+            line_hist.title = f"[{comp}] - 历史增长趋势 (努力痕迹)"
+            line_hist.style = 13
+            line_hist.width = 15
+            line_hist.height = 7.5
+            line_hist.add_data(Reference(ws3, min_col=1, min_row=time_new_row, max_col=len(all_years)+1, max_row=time_cum_row), from_rows=True, titles_from_data=True)
+            line_hist.set_categories(Reference(ws3, min_col=2, min_row=time_title_row, max_col=len(all_years)+1, max_row=time_title_row))
+            for i, s in enumerate(line_hist.series):
+                try: 
+                    s.graphicalProperties.line.solidFill = sw_colors[i % len(sw_colors)]
+                    s.graphicalProperties.line.width = 30000 
+                except: 
+                    pass
+                
+            # (2) 历史饼图
+            pie_hist = PieChart()
+            pie_hist.title = f"[{comp}] - 历史 DR 资产分布"
+            pie_hist.style = 26
+            pie_hist.width = 12
+            pie_hist.height = 7.5
+            pie_hist.add_data(Reference(ws3, min_col=2, min_row=dr_data_row, max_col=6, max_row=dr_data_row), from_rows=True, titles_from_data=False)
+            pie_hist.set_categories(Reference(ws3, min_col=2, min_row=dr_title_row, max_col=6, max_row=dr_title_row))
+            pie_hist.dataLabels = DataLabelList()
+            pie_hist.dataLabels.showPercent = True
+            pie_hist.dataLabels.showVal = False
+            pie_hist.dataLabels.showSerName = False
+            
+            # (3) Live 折线图
+            line_live = LineChart()
+            line_live.title = f"[{comp}] - 现存外链趋势 (Live实际资产)"
+            line_live.style = 13
+            line_live.width = 15
+            line_live.height = 7.5
+            line_live.add_data(Reference(ws3, min_col=1, min_row=time_new_live_row, max_col=len(all_years)+1, max_row=time_cum_live_row), from_rows=True, titles_from_data=True)
+            line_live.set_categories(Reference(ws3, min_col=2, min_row=time_title_row, max_col=len(all_years)+1, max_row=time_title_row))
+            for i, s in enumerate(line_live.series):
+                try: 
+                    s.graphicalProperties.line.solidFill = sw_colors[(i+2) % len(sw_colors)]
+                    s.graphicalProperties.line.width = 30000 
+                except: 
+                    pass
+                
+            # (4) Live 饼图
+            pie_live = PieChart()
+            pie_live.title = f"[{comp}] - 现存 DR 资产分布 (Live)"
+            pie_live.style = 26
+            pie_live.width = 12
+            pie_live.height = 7.5
+            pie_live.add_data(Reference(ws3, min_col=2, min_row=dr_live_data_row, max_col=6, max_row=dr_live_data_row), from_rows=True, titles_from_data=False)
+            pie_live.set_categories(Reference(ws3, min_col=2, min_row=dr_title_row, max_col=6, max_row=dr_title_row))
+            pie_live.dataLabels = DataLabelList()
+            pie_live.dataLabels.showPercent = True
+            pie_live.dataLabels.showVal = False
+            pie_live.dataLabels.showSerName = False
+
+            # 将 4 个图表并排叠加布置！
+            ws3.add_chart(line_hist, f"A{chart_anchor_row}")
+            ws3.add_chart(pie_hist, f"I{chart_anchor_row}")
+            ws3.add_chart(line_live, f"A{chart_anchor_row + 15}")
+            ws3.add_chart(pie_live, f"I{chart_anchor_row + 15}")
+            
+            # 将底部空行设为 32 行，给上下两排图表预留足够的高度！
+            for _ in range(32):
                 ws3.append([])
 
         # ==========================================
@@ -427,7 +496,7 @@ def generate_strategic_reports(conn, total_files, global_headers):
             ws4 = wb.create_sheet("全局竞品大盘对比")
             ws4.sheet_view.showGridLines = False
 
-            data_start_row = 50
+            data_start_row = 100
             current_row = data_start_row
             
             # ------ 1. 新增域名数表 ------
@@ -601,6 +670,102 @@ def generate_strategic_reports(conn, total_files, global_headers):
             ws4.add_chart(chart_health, "M2")
             ws4.add_chart(chart_dr, "A24")
             ws4.add_chart(chart_sitewide, "M24") # 第四张图换成极具价值的作弊侦测图！
+
+
+
+            # ==========================
+            # 🔴 🔥 无缝追加：现存外链(Live) 专属大盘数据及 4 张图表
+            # ==========================
+            current_row = ws4.max_row + 5 
+            
+            ws4.cell(row=current_row, column=1, value="[🔴 LIVE 底层数据源] 现存累加引荐域名总规模").font = Font(bold=True)
+            current_row += 1
+            ws4.append(headers_time)
+            live_cum_start_row = current_row
+            for comp in comp_list:
+                live_new = [comp_time_stats_live[comp].get(y, 0) for y in all_years]
+                live_cum = []; cum = 0
+                for n in live_new: cum += n; live_cum.append(cum)
+                ws4.append([comp] + live_cum)
+            live_cum_end_row = ws4.max_row
+            current_row = ws4.max_row + 2
+            
+            ws4.cell(row=current_row, column=1, value="[🔴 LIVE 底层数据源] 现存引荐域名健康度对比").font = Font(bold=True)
+            current_row += 1
+            ws4.append(["竞品名称", "Live Dofollow占比", "Live Spam垃圾占比", "Live 高权重(DR>40)占比"])
+            live_health_start_row = current_row
+            for comp in comp_list:
+                stats = comp_stats[comp]
+                ld = stats['live_domains']
+                if ld == 0: ws4.append([comp, 0, 0, 0])
+                else:
+                    ws4.append([comp, stats['live_dofollow']/ld, stats['live_spam']/ld, (stats['live_40-60']+stats['live_60-80']+stats['live_80-100'])/ld])
+                    for c in range(2, 5): ws4.cell(row=ws4.max_row, column=c).number_format = '0.00%'
+            live_health_end_row = ws4.max_row
+            current_row = ws4.max_row + 2
+            
+            ws4.cell(row=current_row, column=1, value="[🔴 LIVE 底层数据源] 现存引荐域名 DR 权重结构").font = Font(bold=True)
+            current_row += 1
+            ws4.append(["竞品名称", "0-20(极差)", "20-40(普通)", "40-60(优质)", "60-80(权威)", "80-100(顶配)"])
+            live_dr_start_row = current_row
+            for comp in comp_list:
+                stats = comp_stats[comp]
+                ld = stats['live_domains']
+                if ld == 0: ws4.append([comp, 0, 0, 0, 0, 0])
+                else:
+                    ws4.append([comp, stats['live_0-20']/ld, stats['live_20-40']/ld, stats['live_40-60']/ld, stats['live_60-80']/ld, stats['live_80-100']/ld])
+                    for c in range(2, 7): ws4.cell(row=ws4.max_row, column=c).number_format = '0.00%'
+            live_dr_end_row = ws4.max_row
+            current_row = ws4.max_row + 2
+            
+            ws4.cell(row=current_row, column=1, value="[🔴 LIVE 底层数据源] 现存单域名外链比 (Sitewide)").font = Font(bold=True)
+            current_row += 1
+            ws4.append(["竞品名称", "现存引荐域名(Live)", "现存总外链(Live)", "单域名外链比"])
+            live_sw_start_row = current_row
+            for comp in comp_list:
+                stats = comp_stats[comp]
+                ld = stats['live_domains']
+                lb = stats['live_backlinks']
+                ws4.append([comp, ld, lb, lb/ld if ld else 0])
+            live_sw_end_row = ws4.max_row
+
+            # --- 画 4 个专属的 LIVE 仪表盘图表 ---
+            chart_cum_live = LineChart(); chart_cum_live.title = "[🔴Live 现存] 全竞品真实护城河走势"; chart_cum_live.style = 2; chart_cum_live.width = 23; chart_cum_live.height = 12
+            chart_cum_live.add_data(Reference(ws4, min_col=1, min_row=live_cum_start_row+1, max_col=len(all_years)+1, max_row=live_cum_end_row), from_rows=True, titles_from_data=True)
+            chart_cum_live.set_categories(Reference(ws4, min_col=2, min_row=live_cum_start_row, max_col=len(all_years)+1, max_row=live_cum_start_row))
+
+            chart_health_live = BarChart(); chart_health_live.type = "col"; chart_health_live.style = 2; chart_health_live.grouping = "clustered"; chart_health_live.title = "[🔴Live 现存] 域名资产健康度"
+            chart_health_live.width = 23; chart_health_live.height = 12
+            chart_health_live.add_data(Reference(ws4, min_col=2, min_row=live_health_start_row, max_col=4, max_row=live_health_end_row), titles_from_data=True)
+            chart_health_live.set_categories(Reference(ws4, min_col=1, min_row=live_health_start_row+1, max_col=1, max_row=live_health_end_row))
+
+            chart_dr_live = BarChart(); chart_dr_live.type = "col"; chart_dr_live.style = 2; chart_dr_live.grouping = "stacked"; chart_dr_live.overlap = 100; chart_dr_live.title = "[🔴Live 现存] DR 权重真实结构"
+            chart_dr_live.width = 23; chart_dr_live.height = 12
+            chart_dr_live.add_data(Reference(ws4, min_col=2, min_row=live_dr_start_row, max_col=6, max_row=live_dr_end_row), titles_from_data=True)
+            chart_dr_live.set_categories(Reference(ws4, min_col=1, min_row=live_dr_start_row+1, max_col=1, max_row=live_dr_end_row))
+
+            chart_sw_live = BarChart(); chart_sw_live.type = "col"; chart_sw_live.style = 2; chart_sw_live.grouping = "clustered"; chart_sw_live.title = "[🔴Live 现存] 单域名外链比 (预警)"
+            chart_sw_live.width = 23; chart_sw_live.height = 12
+            chart_sw_live.add_data(Reference(ws4, min_col=4, min_row=live_sw_start_row, max_col=4, max_row=live_sw_end_row), titles_from_data=True)
+            chart_sw_live.set_categories(Reference(ws4, min_col=1, min_row=live_sw_start_row+1, max_col=1, max_row=live_sw_end_row))
+
+            for i, s in enumerate(chart_cum_live.series):
+                try: 
+                    s.graphicalProperties.line.solidFill = sw_colors[i % len(sw_colors)]
+                    s.graphicalProperties.line.width = 30000
+                except: 
+                    pass
+            for chart in [chart_health_live, chart_dr_live, chart_sw_live]:
+                for i, s in enumerate(chart.series):
+                    try: 
+                        s.graphicalProperties.solidFill = sw_colors[i % len(sw_colors)]
+                    except: 
+                        pass
+
+            ws4.add_chart(chart_cum_live, "A46")
+            ws4.add_chart(chart_health_live, "M46")
+            ws4.add_chart(chart_dr_live, "A68")
+            ws4.add_chart(chart_sw_live, "M68")
 
         # ==========================================
         # --- Sheet 5: 流量对比 (大图置顶 + 高端色系 + 完美布局) ---
