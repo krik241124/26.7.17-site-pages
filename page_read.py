@@ -292,7 +292,11 @@ def generate_page_reports(conn, global_headers):
             chart_pie.add_data(data, titles_from_data=False)
             chart_pie.set_categories(labels)
             chart_pie.dataLabels = DataLabelList()
-            chart_pie.dataLabels.showPercent = True; chart_pie.dataLabels.showVal = False
+            chart_pie.dataLabels.showPercent = True
+            chart_pie.dataLabels.showCatName = True
+            chart_pie.dataLabels.showSerName = False
+            chart_pie.dataLabels.showVal = False
+            
             
             # 图表放置位置
             chart_anchor = f"G{m_title_row+2}"
