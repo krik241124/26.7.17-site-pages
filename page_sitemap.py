@@ -144,7 +144,16 @@ def scan_and_group_ahrefs_data(data_dir):
 # ================= 4. 构建超级目录树算法 =================
 def build_tree_structure(df):
     tree = {}
-    for _, row in df.iterrows():
+    total_rows = len(df)
+    
+    # 🌟 修改点：用 enumerate 获取真实的循环次数 count
+    for count, (_, row) in enumerate(df.iterrows()):
+        
+        # ========== 实时进度反馈 ==========
+        if count > 0 and count % 50000 == 0:
+            logger.info(f"   👉 拓扑树构建进度: 已处理 {count} / {total_rows} 页面 ({(count/total_rows)*100:.1f}%)")
+        # ===============================
+        
         url = row['Final_URL']
         parsed = urlparse(url)
         domain = parsed.netloc.replace('www.', '')
@@ -162,6 +171,22 @@ def build_tree_structure(df):
                     'top_kw': row.get('Top_Keyword', ''), 'in_sitemap': row['In_Sitemap']
                 }
             current = current[part]['__children__']
+
+    # === 【之前新增的：递归计算包含子节点的总流量和总页面数】 ===
+    def calculate_node_stats(node):
+        node_traffic = node.get('__data__', {}).get('traffic', 0) if node.get('__data__') else 0
+        node_pages = 1 if node.get('__data__') else 0
+        for k, child in node.get('__children__', {}).items():
+            child_traffic, child_pages = calculate_node_stats(child)
+            node_traffic += child_traffic
+            node_pages += child_pages
+        node['__total_traffic__'] = node_traffic
+        node['__total_pages__'] = node_pages
+        return node_traffic, node_pages
+
+
+    for k, v in tree.items():
+        calculate_node_stats(v)
     return tree
 
 def write_tree_to_txt(node_dict, f, prefix="", is_last=True, node_name=""):
@@ -172,41 +197,38 @@ def write_tree_to_txt(node_dict, f, prefix="", is_last=True, node_name=""):
 
     connector = "└── " if is_last else "├── "
     data = node_dict.get('__data__')
+    total_traffic = node_dict.get('__total_traffic__', 0)
+    total_pages = node_dict.get('__total_pages__', 0)
     
-    line = f"{prefix}{connector}{node_name}/"
-    if data:
-        if data['traffic'] > 0:
-            t = int(data['traffic'])
-            # 动态分级图标视觉
-            if t >= 1000: icon = "🔥🔥🔥"
-            elif t >= 100: icon = "🔥"
-            elif t >= 10: icon = "🌟"
-            else: icon = "⭐"
-            
-            # 防止空值显示成 nan
-            kw_str = str(data['top_kw']) if pd.notna(data['top_kw']) else ""
-            traffic_info = f" [{icon} 流量: {t} | 词: {int(data['kw'])} | 核心词: {kw_str}]"
-        else:
-            traffic_info = " [流量: 0]"
-            if not data['in_sitemap']: traffic_info += " (孤岛页/不在Sitemap)"
-        line = f"{prefix}{connector}{node_name}{traffic_info}"
+    line = f"{prefix}{connector}{node_name} ({total_pages}个页面)"
+    
+    if total_traffic > 0:
+        t = int(total_traffic)
+        if t >= 1000: icon = "🔥🔥🔥"
+        elif t >= 100: icon = "🔥"
+        elif t >= 10: icon = "🌟"
+        else: icon = "⭐"
         
-    f.write(line + "\n")
+        # 兼容处理有无具体节点数据的情况
+        kw_val = int(data['kw']) if data else 0
+        kw_str = str(data['top_kw']) if data and pd.notna(data.get('top_kw')) else ""
+        traffic_info = f" [{icon} 流量: {t} | 词: {kw_val} | 核心词: {kw_str}]"
+    else:
+        traffic_info = " [流量: 0]"
+        if data and not data.get('in_sitemap'): traffic_info += " (孤岛页/不在Sitemap)"
+        
+    f.write(line + traffic_info + "\n")
 
     children = node_dict.get('__children__', {})
     if children:
         child_prefix = prefix + ("    " if is_last else "│   ")
         keys = list(children.keys())
         
-        # 将有流量的页面顶置
-        def sort_key(k):
-            d = children[k].get('__data__')
-            return -d['traffic'] if d else 0
-            
-        keys.sort(key=sort_key)
+        # 核心修复：按包含子目录在内的总流量进行降序排列
+        keys.sort(key=lambda k: -children[k].get('__total_traffic__', 0))
         
-        traffic_keys = [k for k in keys if (children[k].get('__data__') or {}).get('traffic', 0) > 0]
-        zero_keys = [k for k in keys if (children[k].get('__data__') or {}).get('traffic', 0) == 0]
+        traffic_keys = [k for k in keys if children[k].get('__total_traffic__', 0) > 0]
+        zero_keys = [k for k in keys if children[k].get('__total_traffic__', 0) == 0]
         
         display_keys = traffic_keys + zero_keys[:MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE]
         hidden_count = len(zero_keys) - MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE
@@ -217,6 +239,7 @@ def write_tree_to_txt(node_dict, f, prefix="", is_last=True, node_name=""):
             
         if hidden_count > 0:
             f.write(f"{child_prefix}└── ... (以及其他 {hidden_count} 个无流量结构页面)\n")
+            
 
 # ================= 5. 可视化 Treemap =================
 def generate_dashboard(merged_df, domain):
@@ -225,59 +248,108 @@ def generate_dashboard(merged_df, domain):
         path = unquote(urlparse(url).path).strip('/')
         return path.split('/')[:3] if path else ['Home']
         
-    merged_df['L1'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[0] if len(extract_path_levels(x)) > 0 else 'Home')
-    merged_df['L2'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[1] if len(extract_path_levels(x)) > 1 else 'N/A')
+    merged_df['L1'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[0] if len(extract_path_levels(x)) > 0 else '根目录')
+    merged_df['L2'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[1] if len(extract_path_levels(x)) > 1 else '[无二级目录]')
     
     plot_df = merged_df[merged_df['Traffic'] > 0].copy()
-    if plot_df.empty:
-        logger.warning(f"⚠️ [{domain}] 没有任何流量数据，跳过树图绘制。")
-        return
+    if plot_df.empty: return
 
     plot_df['Root'] = f"{domain} 全站流量"
+    # 防止空值引起图表报错
+    plot_df['Top_Keyword'] = plot_df['Top_Keyword'].fillna('无')
+    
+    # 悬浮数据按顺序放入 customdata：0是URL, 1是词数, 2是核心词
     fig = px.treemap(
         plot_df, path=['Root', 'L1', 'L2'], values='Traffic',
-        color='Traffic', hover_data=['Keywords', 'Final_URL'],
-        color_continuous_scale='Viridis', title=f"🌐 {domain} SEO 流量拓扑树图"
+        color='Traffic', color_continuous_scale='Viridis',
+        hover_data=['Final_URL', 'Keywords', 'Top_Keyword'], 
+        title=f"🌐 {domain} SEO 流量拓扑树图 (Sitemap 总收录: {len(merged_df)} 页面)"
     )
+    
+    # 强制覆盖原本工程化的丑陋提示框，把你要的参数全部漂亮地排版出来！
+    # （注意：由于 Plotly 的特性，父级文件夹因为没有具体单一URL，会自动显示为上级汇总数据或留空，这是正常现象）
+    fig.update_traces(
+        hovertemplate=(
+            "<b style='font-size:14px;'>节点: %{label}</b><br>"
+            "<hr>"
+            "📈 <b>流量总计 (含子页)</b>: %{value:.0f}<br>"
+            "🔗 <b>页面 URL</b>: %{customdata[0]}<br>"
+            "🎯 <b>关键词数</b>: %{customdata[1]}<br>"
+            "👑 <b>核心搜索词</b>: %{customdata[2]}"
+        )
+    )
+    
     fig.update_layout(template="plotly_dark", margin=dict(t=50, l=25, r=25, b=25))
     fig.write_html(output_html)
 
 
 
 
-def generate_html_tree(node_dict, node_name=""):
-    """递归生成原生的 HTML 可折叠树菜单"""
+def generate_html_tree(node_dict, node_name="", progress=None):
+    """递归生成原生的 HTML 可折叠树菜单 (带实时进度追踪)"""
+    
+    # 初始化递归状态追踪器 (利用字典的可变性穿透递归层级)
+    if progress is None:
+        progress = {"count": 0}
+
+    # 累加节点处理量，每拼装 20000 个节点向控制台报一次平安
+    progress["count"] += 1
+    if progress["count"] % 20000 == 0:
+        logger.info(f"   👉 网页渲染进度: 绝对没卡死！已生成 {progress['count']} 个树形节点的 HTML 代码...")
+
     if not node_name:
         html = "<ul class='tree'>"
-        for k, v in node_dict.items(): html += generate_html_tree(v, k)
+        for k, v in node_dict.items(): html += generate_html_tree(v, k, progress)
         return html + "</ul>"
 
     data = node_dict.get('__data__')
     children = node_dict.get('__children__', {})
     
+    # 获取刚计算好的：包含子目录在内的总流量 和 总页面数
+    total_traffic = node_dict.get('__total_traffic__', 0)
+    total_pages = node_dict.get('__total_pages__', 0)
+    
     label = f"📁 {node_name}" if children else f"📄 {node_name}"
-    if data and data['traffic'] > 0:
-        t = int(data['traffic'])
+    # 低调朴素地加个页面数量
+    label += f" <span style='color:#888; font-size:12px;'>({total_pages}个页面)</span>"
+
+    if total_traffic > 0:
+        t = int(total_traffic)
         if t >= 1000: icon, color = "🔥🔥🔥", "#ff4757"
         elif t >= 100: icon, color = "🔥", "#ffa502"
         elif t >= 10: icon, color = "🌟", "#eccc68"
         else: icon, color = "⭐", "#7bed9f"
-        kw_str = str(data['top_kw']) if pd.notna(data['top_kw']) else ""
-        label += f" <span style='color:{color}; font-size:14px; font-weight:bold;'>[{icon} 流量:{t} | 词:{int(data['kw'])} | 词:{kw_str}]</span>"
-    elif data:
+        
+        kw_str = str(data['top_kw']) if data and pd.notna(data.get('top_kw')) else ""
+        kw_show = f" | 核心词:{kw_str}" if kw_str else ""
+        label += f" <span style='color:{color}; font-size:14px; font-weight:bold;'>[{icon} 流量:{t}{kw_show}]</span>"
+    else:
         label += f" <span style='color:#747d8c; font-size:12px;'>[流量: 0]</span>"
 
     html = "<li>"
     if children:
         html += f"<details open><summary>{label}</summary><ul>"
         keys = list(children.keys())
-        traffic_keys = [k for k in keys if (children[k].get('__data__') or {}).get('traffic', 0) > 0]
-        zero_keys = [k for k in keys if (children[k].get('__data__') or {}).get('traffic', 0) == 0]
-        display_keys = traffic_keys + zero_keys[:MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE]
         
-        for k in display_keys: html += generate_html_tree(children[k], k)
-        if len(zero_keys) > MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE:
-            html += f"<li><span style='color:#a4b0be; font-size:12px;'>... (及其他 {len(zero_keys) - MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE} 个无流量页)</span></li>"
+        # 这里的判断逻辑改成看 __total_traffic__，修复原来只看索引页导致失踪的bug
+        traffic_keys = [k for k in keys if children[k].get('__total_traffic__', 0) > 0]
+        zero_keys = [k for k in keys if children[k].get('__total_traffic__', 0) == 0]
+        
+        # 流量节点降序排
+        traffic_keys.sort(key=lambda k: -children[k].get('__total_traffic__', 0))
+        
+        display_keys = traffic_keys + zero_keys[:MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE]
+        hidden_keys = zero_keys[MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE:]
+        
+        # 传入 progress 字典保持全链路追踪
+        for k in display_keys: html += generate_html_tree(children[k], k, progress)
+        
+        if hidden_keys:
+            # 这里的 details 增加了 name="zombie_accordion"，同名 details 就会变成单选切换（防爆屏）
+            html += f"<li><details name='zombie_accordion'><summary style='color:#a4b0be; font-size:12px; cursor:pointer;'>... (点击展开其他 {len(hidden_keys)} 个无流量页面)</summary><ul>"
+            for k in hidden_keys: html += generate_html_tree(children[k], k, progress)
+            html += "</ul></details></li>"
+            
         html += "</ul></details>"
     else:
         html += f"<div style='padding-left: 20px;'>{label}</div>"
@@ -321,16 +393,20 @@ def main():
         merged_df['In_Sitemap'] = merged_df['Sitemap_URL'].notna()
 
         # 生成独家 TXT 树状图
-        logger.info(f"正在渲染 {domain} 全站拓扑目录树 (因为有数百万页面折叠，这可能需要几十秒)...")
+        logger.info(f"⏳ 步骤 1/4: 正在解析 {len(merged_df)} 个URL并构建节点字典 (大约需要 20-40 秒)...")
         tree_data = build_tree_structure(merged_df)
+        
+        logger.info(f"⏳ 步骤 2/4: 正在生成纯文本拓扑树 TXT 文件...")
         tree_file = f"{domain}_seo_architecture_tree.txt"
         with open(tree_file, "w", encoding="utf-8") as f:
             f.write(f"🌐 {domain} SEO 拓扑全景图\n")
             f.write("="*60 + "\n")
             write_tree_to_txt(tree_data, f)
         
-        # 生成大屏与数据表格
+        logger.info(f"⏳ 步骤 3/4: 正在生成可视化数据大屏 HTML...")
         generate_dashboard(merged_df, domain)
+        
+        logger.info(f"⏳ 步骤 4/4: 正在递归生成可折叠的底层 HTML 树形代码 (因为有超过 50 万个节点，极度耗费性能，大约需要 1-3 分钟，请耐心等待绝对没卡死！)...")
         
 
 
