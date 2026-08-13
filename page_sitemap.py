@@ -174,16 +174,32 @@ def build_tree_structure(df):
 
     # === 【之前新增的：递归计算包含子节点的总流量和总页面数】 ===
     def calculate_node_stats(node):
-        node_traffic = node.get('__data__', {}).get('traffic', 0) if node.get('__data__') else 0
-        node_pages = 1 if node.get('__data__') else 0
+        data = node.get('__data__')
+        node_traffic = data.get('traffic', 0) if data else 0
+        node_pages = 1 if data else 0
+        node_kw = data.get('kw', 0) if data else 0
+        
+        # 核心词逻辑
+        best_kw_str = data.get('top_kw', '') if data else ''
+        if pd.isna(best_kw_str): best_kw_str = ''
+        max_traffic_for_kw = node_traffic if best_kw_str else -1
+        
         for k, child in node.get('__children__', {}).items():
-            child_traffic, child_pages = calculate_node_stats(child)
-            node_traffic += child_traffic
-            node_pages += child_pages
+            c_traffic, c_pages, c_kw, c_top_kw, c_max_t = calculate_node_stats(child)
+            node_traffic += c_traffic
+            node_pages += c_pages
+            node_kw += c_kw
+            if c_max_t > max_traffic_for_kw and c_top_kw:
+                best_kw_str = c_top_kw
+                max_traffic_for_kw = c_max_t
+                
         node['__total_traffic__'] = node_traffic
         node['__total_pages__'] = node_pages
-        return node_traffic, node_pages
-
+        node['__total_kw__'] = node_kw
+        node['__best_kw__'] = best_kw_str
+        node['__max_traffic_for_kw__'] = max_traffic_for_kw
+        
+        return node_traffic, node_pages, node_kw, best_kw_str, max_traffic_for_kw
 
     for k, v in tree.items():
         calculate_node_stats(v)
@@ -242,7 +258,7 @@ def write_tree_to_txt(node_dict, f, prefix="", is_last=True, node_name=""):
             
 
 # ================= 5. 可视化 Treemap =================
-def generate_dashboard(merged_df, domain):
+def generate_dashboard(merged_df, domain, tree_data):
     output_html = f"{domain}_seo_dashboard.html"
     def extract_path_levels(url):
         path = unquote(urlparse(url).path).strip('/')
@@ -250,32 +266,62 @@ def generate_dashboard(merged_df, domain):
         
     merged_df['L1'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[0] if len(extract_path_levels(x)) > 0 else '根目录')
     merged_df['L2'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[1] if len(extract_path_levels(x)) > 1 else '[无二级目录]')
+    merged_df['L3'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[2] if len(extract_path_levels(x)) > 2 else '[无三级目录]')
     
     plot_df = merged_df[merged_df['Traffic'] > 0].copy()
     if plot_df.empty: return
 
     plot_df['Root'] = f"{domain} 全站流量"
-    # 防止空值引起图表报错
     plot_df['Top_Keyword'] = plot_df['Top_Keyword'].fillna('无')
     
-    # 悬浮数据按顺序放入 customdata：0是URL, 1是词数, 2是核心词
     fig = px.treemap(
-        plot_df, path=['Root', 'L1', 'L2'], values='Traffic',
+        plot_df, path=['Root', 'L1', 'L2', 'L3'], values='Traffic',
         color='Traffic', color_continuous_scale='Viridis',
-        hover_data=['Final_URL', 'Keywords', 'Top_Keyword'], 
         title=f"🌐 {domain} SEO 流量拓扑树图 (Sitemap 总收录: {len(merged_df)} 页面)"
     )
     
-    # 强制覆盖原本工程化的丑陋提示框，把你要的参数全部漂亮地排版出来！
-    # （注意：由于 Plotly 的特性，父级文件夹因为没有具体单一URL，会自动显示为上级汇总数据或留空，这是正常现象）
+    # 强制注入准确统计数据以对齐下方目录树
+    import numpy as np
+    if fig.data:
+        ids = fig.data[0].ids
+        new_customdata = []
+        for node_id in ids:
+            parts = str(node_id).split('/')
+            if len(parts) > 0 and parts[0] == f"{domain} 全站流量":
+                parts = parts[1:]
+            
+            # 定位到对应目录节点
+            root_key = list(tree_data.keys())[0] if tree_data else None
+            current = tree_data.get(root_key, {}) if root_key else {}
+            
+            for p in parts:
+                if p in ('根目录', '[无二级目录]', '[无三级目录]', 'Home'): continue
+                if current and '__children__' in current and p in current['__children__']:
+                    current = current['__children__'][p]
+                else:
+                    current = {}
+                    break
+            
+            # 把精确获取到的词数和汇总数据怼进图表里
+            if current:
+                t_pages = current.get('__total_pages__', 0)
+                t_kw = current.get('__total_kw__', 0)
+                b_kw = current.get('__best_kw__', '无')
+                if not b_kw: b_kw = '无'
+                new_customdata.append([node_id, t_kw, b_kw, t_pages])
+            else:
+                new_customdata.append([node_id, 0, '无', 0])
+                
+        fig.data[0].customdata = np.array(new_customdata)
+        
     fig.update_traces(
         hovertemplate=(
             "<b style='font-size:14px;'>节点: %{label}</b><br>"
             "<hr>"
             "📈 <b>流量总计 (含子页)</b>: %{value:.0f}<br>"
-            "🔗 <b>页面 URL</b>: %{customdata[0]}<br>"
-            "🎯 <b>关键词数</b>: %{customdata[1]}<br>"
-            "👑 <b>核心搜索词</b>: %{customdata[2]}"
+            "🎯 <b>关键词数 (含子页)</b>: %{customdata[1]}<br>"
+            "👑 <b>核心搜索词 (含子页)</b>: %{customdata[2]}<br>"
+            "📄 <b>包含页面数 (含子页)</b>: %{customdata[3]}"
         )
     )
     
@@ -285,32 +331,26 @@ def generate_dashboard(merged_df, domain):
 
 
 
-def generate_html_tree(node_dict, node_name="", progress=None):
-    """递归生成原生的 HTML 可折叠树菜单 (带实时进度追踪)"""
-    
-    # 初始化递归状态追踪器 (利用字典的可变性穿透递归层级)
+def generate_html_tree(node_dict, node_name=None, progress=None, level=0):
     if progress is None:
         progress = {"count": 0}
 
-    # 累加节点处理量，每拼装 20000 个节点向控制台报一次平安
     progress["count"] += 1
     if progress["count"] % 20000 == 0:
         logger.info(f"   👉 网页渲染进度: 绝对没卡死！已生成 {progress['count']} 个树形节点的 HTML 代码...")
 
-    if not node_name:
-        html = "<ul class='tree'>"
-        for k, v in node_dict.items(): html += generate_html_tree(v, k, progress)
+    if node_name is None:
+        html = "<ul class='tree' id='seo-tree'>"
+        for k, v in node_dict.items(): html += generate_html_tree(v, k, progress, level=1)
         return html + "</ul>"
 
     data = node_dict.get('__data__')
     children = node_dict.get('__children__', {})
     
-    # 获取刚计算好的：包含子目录在内的总流量 和 总页面数
     total_traffic = node_dict.get('__total_traffic__', 0)
     total_pages = node_dict.get('__total_pages__', 0)
     
     label = f"📁 {node_name}" if children else f"📄 {node_name}"
-    # 低调朴素地加个页面数量
     label += f" <span style='color:#888; font-size:12px;'>({total_pages}个页面)</span>"
 
     if total_traffic > 0:
@@ -320,34 +360,33 @@ def generate_html_tree(node_dict, node_name="", progress=None):
         elif t >= 10: icon, color = "🌟", "#eccc68"
         else: icon, color = "⭐", "#7bed9f"
         
+        # 兼容读取父级合并上来的核心关键词
         kw_str = str(data['top_kw']) if data and pd.notna(data.get('top_kw')) else ""
+        if not kw_str and node_dict.get('__best_kw__'): kw_str = node_dict.get('__best_kw__')
         kw_show = f" | 核心词:{kw_str}" if kw_str else ""
+        
         label += f" <span style='color:{color}; font-size:14px; font-weight:bold;'>[{icon} 流量:{t}{kw_show}]</span>"
     else:
         label += f" <span style='color:#747d8c; font-size:12px;'>[流量: 0]</span>"
 
     html = "<li>"
     if children:
-        html += f"<details open><summary>{label}</summary><ul>"
+        # ✅ 去掉了 open 属性，改为注入等级属性供 JS 控制（彻底防崩溃）
+        html += f"<details data-level='{level}' data-traffic='{total_traffic}'><summary>{label}</summary><ul>"
         keys = list(children.keys())
         
-        # 这里的判断逻辑改成看 __total_traffic__，修复原来只看索引页导致失踪的bug
         traffic_keys = [k for k in keys if children[k].get('__total_traffic__', 0) > 0]
         zero_keys = [k for k in keys if children[k].get('__total_traffic__', 0) == 0]
-        
-        # 流量节点降序排
         traffic_keys.sort(key=lambda k: -children[k].get('__total_traffic__', 0))
         
         display_keys = traffic_keys + zero_keys[:MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE]
         hidden_keys = zero_keys[MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE:]
         
-        # 传入 progress 字典保持全链路追踪
-        for k in display_keys: html += generate_html_tree(children[k], k, progress)
+        for k in display_keys: html += generate_html_tree(children[k], k, progress, level + 1)
         
         if hidden_keys:
-            # 这里的 details 增加了 name="zombie_accordion"，同名 details 就会变成单选切换（防爆屏）
-            html += f"<li><details name='zombie_accordion'><summary style='color:#a4b0be; font-size:12px; cursor:pointer;'>... (点击展开其他 {len(hidden_keys)} 个无流量页面)</summary><ul>"
-            for k in hidden_keys: html += generate_html_tree(children[k], k, progress)
+            html += f"<li><details data-level='{level+1}' data-traffic='0' name='zombie_accordion'><summary style='color:#a4b0be; font-size:12px; cursor:pointer;'>... (点击展开其他 {len(hidden_keys)} 个无流量页面)</summary><ul>"
+            for k in hidden_keys: html += generate_html_tree(children[k], k, progress, level + 2)
             html += "</ul></details></li>"
             
         html += "</ul></details>"
@@ -403,19 +442,60 @@ def main():
             f.write("="*60 + "\n")
             write_tree_to_txt(tree_data, f)
         
+        # 注意这里：把 tree_data 给传进图表里强行获取真实目录数据
         logger.info(f"⏳ 步骤 3/4: 正在生成可视化数据大屏 HTML...")
-        generate_dashboard(merged_df, domain)
+        generate_dashboard(merged_df, domain, tree_data) 
         
-        logger.info(f"⏳ 步骤 4/4: 正在递归生成可折叠的底层 HTML 树形代码 (因为有超过 50 万个节点，极度耗费性能，大约需要 1-3 分钟，请耐心等待绝对没卡死！)...")
-        
+        logger.info(f"⏳ 步骤 4/4: 正在递归生成可折叠的底层 HTML 树形代码...")
 
-
-        # ====== [新增] 追加酷炫的可折叠 HTML 树状图到底部 ======
+        # ====== 追加酷炫的可折叠 HTML 树状图到底部（含JS按钮面板防卡） ======
         html_tree = generate_html_tree(tree_data)
         with open(f"{domain}_seo_dashboard.html", "a", encoding="utf-8") as f:
             f.write(f"""
             <hr style='border:1px solid #444; margin: 40px 0;'>
             <h2 style='color:#fff; text-align:center; font-family:sans-serif;'>🌳 {domain} 详细目录拓扑树 (原生可折叠)</h2>
+            
+            <!-- JS 交互面板 -->
+            <div style="text-align:center; margin-bottom: 20px;">
+                <button onclick="expandTree(2)" style="padding:10px 15px; margin:5px; cursor:pointer; background:#00a8ff; color:#fff; border:none; border-radius:4px; font-weight:bold;">展开到 1 级目录</button>
+                <button onclick="expandTree(3)" style="padding:10px 15px; margin:5px; cursor:pointer; background:#00a8ff; color:#fff; border:none; border-radius:4px; font-weight:bold;">展开到 2 级目录</button>
+                <button onclick="expandTree(4)" style="padding:10px 15px; margin:5px; cursor:pointer; background:#00a8ff; color:#fff; border:none; border-radius:4px; font-weight:bold;">展开到 3 级目录</button>
+                <button onclick="collapseAll()" style="padding:10px 15px; margin:5px; cursor:pointer; background:#444; color:#fff; border:none; border-radius:4px; font-weight:bold;">全部折叠</button>
+            </div>
+            
+            <script>
+                function expandTree(targetLevel) {{
+                    document.body.style.cursor = 'wait';
+                    setTimeout(() => {{
+                        const details = document.querySelectorAll('#seo-tree details');
+                        details.forEach(d => {{
+                            const level = parseInt(d.getAttribute('data-level')) || 999;
+                            const traffic = parseFloat(d.getAttribute('data-traffic')) || 0;
+                            
+                            if (level < targetLevel) {{
+                                d.open = true;
+                            }} else {{
+                                d.open = false;
+                            }}
+                            
+                            // 🚀 防崩溃降级策略：如果你请求打开过深的层级，只要这分支没流量，强制继续让他折叠！
+                            if (traffic === 0 && level >= 2) {{
+                                d.open = false;
+                            }}
+                        }});
+                        document.body.style.cursor = 'default';
+                    }}, 10);
+                }}
+                
+                function collapseAll() {{
+                    const details = document.querySelectorAll('#seo-tree details');
+                    details.forEach(d => d.open = false);
+                }}
+                
+                // 页面打开时，仅默认展示出 1级目录，防止 200万个节点全放出来让电脑死机
+                window.onload = function() {{ expandTree(2); }};
+            </script>
+
             <div style='background:#1e1e1e; color:#d4d4d4; padding:20px; font-family:monospace; line-height:1.8; overflow-x: auto;'>
                 <style>
                     .tree details summary {{ cursor: pointer; outline: none; list-style: none; }}
