@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 from urllib.parse import urlparse, unquote
 import plotly.express as px
+import plotly.graph_objects as go
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -260,72 +261,95 @@ def write_tree_to_txt(node_dict, f, prefix="", is_last=True, node_name=""):
 # ================= 5. 可视化 Treemap =================
 def generate_dashboard(merged_df, domain, tree_data):
     output_html = f"{domain}_seo_dashboard.html"
-    def extract_path_levels(url):
-        path = unquote(urlparse(url).path).strip('/')
-        return path.split('/')[:3] if path else ['Home']
-        
-    merged_df['L1'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[0] if len(extract_path_levels(x)) > 0 else '根目录')
-    merged_df['L2'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[1] if len(extract_path_levels(x)) > 1 else '[无二级目录]')
-    merged_df['L3'] = merged_df['Final_URL'].apply(lambda x: extract_path_levels(x)[2] if len(extract_path_levels(x)) > 2 else '[无三级目录]')
     
-    plot_df = merged_df[merged_df['Traffic'] > 0].copy()
-    if plot_df.empty: return
+    # 我们直接放弃 DataFrame 画图，改为深度遍历你算好的完美字典树 tree_data！
+    plot_data = {
+        'ids': [], 'labels': [], 'parents': [], 'values': [],
+        'kw': [], 'best_kw': [], 'pages': [], 'urls': []
+    }
 
-    plot_df['Root'] = f"{domain} 全站流量"
-    plot_df['Top_Keyword'] = plot_df['Top_Keyword'].fillna('无')
-    
-    fig = px.treemap(
-        plot_df, path=['Root', 'L1', 'L2', 'L3'], values='Traffic',
-        color='Traffic', color_continuous_scale='Viridis',
-        title=f"🌐 {domain} SEO 流量拓扑树图 (Sitemap 总收录: {len(merged_df)} 页面)"
-    )
-    
-    # 强制注入准确统计数据以对齐下方目录树
-    import numpy as np
-    if fig.data:
-        ids = fig.data[0].ids
-        new_customdata = []
-        for node_id in ids:
-            parts = str(node_id).split('/')
-            if len(parts) > 0 and parts[0] == f"{domain} 全站流量":
-                parts = parts[1:]
-            
-            # 定位到对应目录节点
-            root_key = list(tree_data.keys())[0] if tree_data else None
-            current = tree_data.get(root_key, {}) if root_key else {}
-            
-            for p in parts:
-                if p in ('根目录', '[无二级目录]', '[无三级目录]', 'Home'): continue
-                if current and '__children__' in current and p in current['__children__']:
-                    current = current['__children__'][p]
-                else:
-                    current = {}
-                    break
-            
-            # 把精确获取到的词数和汇总数据怼进图表里
-            if current:
-                t_pages = current.get('__total_pages__', 0)
-                t_kw = current.get('__total_kw__', 0)
-                b_kw = current.get('__best_kw__', '无')
-                if not b_kw: b_kw = '无'
-                new_customdata.append([node_id, t_kw, b_kw, t_pages])
-            else:
-                new_customdata.append([node_id, 0, '无', 0])
-                
-        fig.data[0].customdata = np.array(new_customdata)
+    def flatten_tree_for_plotly(node, parent_id, node_id, label):
+        # 取出已经在 build_tree_structure 中计算好的精确数据
+        traffic = node.get('__total_traffic__', 0)
         
-    fig.update_traces(
+        # 优化：为了防止百万页面让浏览器崩溃，如果在绘图时不含流量，直接跳过不画
+        if traffic <= 0:
+            return
+
+        pages = node.get('__total_pages__', 0)
+        kw = node.get('__total_kw__', 0)
+        best_kw = node.get('__best_kw__', '无')
+        if not best_kw: best_kw = '无'
+
+        # 核心逻辑：获取真实的 Final URL 还是 目录路径
+        data = node.get('__data__')
+        if data and data.get('url'):
+            # 如果是具体的末端页面，显示完整 Final URL
+            real_url = data.get('url')
+        else:
+            # 如果是中间的目录节点，显示完整路径
+            real_url = f"[目录组] https://{node_id}"
+
+        # 录入 Plotly 必需的底层数组
+        plot_data['ids'].append(node_id)
+        plot_data['labels'].append(label)
+        plot_data['parents'].append(parent_id)
+        plot_data['values'].append(traffic)
+        plot_data['kw'].append(kw)
+        plot_data['best_kw'].append(best_kw)
+        plot_data['pages'].append(pages)
+        plot_data['urls'].append(real_url)
+
+        # 递归遍历所有子目录和子页面
+        for child_key, child_node in node.get('__children__', {}).items():
+            # ID 必须唯一，所以用完整路径拼接
+            child_id = f"{node_id}/{child_key}" if node_id else child_key
+            flatten_tree_for_plotly(child_node, node_id, child_id, child_key)
+
+    # 启动递归提取
+    for root_key, root_node in tree_data.items():
+        flatten_tree_for_plotly(root_node, "", root_key, root_key)
+
+    if not plot_data['ids']:
+        logger.warning(f"❌ {domain} 没有检测到任何有流量的节点，跳过绘图。")
+        return
+
+    # 使用底层的 graph_objects 构建 Treemap，彻底掌控数据逻辑
+    fig = go.Figure(go.Treemap(
+        ids=plot_data['ids'],
+        labels=plot_data['labels'],
+        parents=plot_data['parents'],
+        values=plot_data['values'],
+        branchvalues='total', # 完美对齐：父节点大小等于子节点之和
+        customdata=list(zip(
+            plot_data['kw'],
+            plot_data['best_kw'],
+            plot_data['pages'],
+            plot_data['urls']
+        )),
         hovertemplate=(
-            "<b style='font-size:14px;'>节点: %{label}</b><br>"
-            "<hr>"
+            "<b style='font-size:16px; color:#00a8ff;'>节点: %{label}</b><br>"
+            "<hr style='border-color:#444;'>"
+            "🔗 <b>完整链接</b>: %{customdata[3]}<br>"
             "📈 <b>流量总计 (含子页)</b>: %{value:.0f}<br>"
-            "🎯 <b>关键词数 (含子页)</b>: %{customdata[1]}<br>"
-            "👑 <b>核心搜索词 (含子页)</b>: %{customdata[2]}<br>"
-            "📄 <b>包含页面数 (含子页)</b>: %{customdata[3]}"
+            "🎯 <b>关键词数 (含子页)</b>: %{customdata[0]}<br>"
+            "👑 <b>核心搜索词 (含子页)</b>: %{customdata[1]}<br>"
+            "📄 <b>包含页面数 (含子页)</b>: %{customdata[2]}<br>"
+            "<extra></extra>" # 隐藏多余的旁支气泡
+        ),
+        textinfo="label+value",
+        marker=dict(
+            colors=plot_data['values'],
+            colorscale='Viridis',
+            showscale=True
         )
-    )
+    ))
     
-    fig.update_layout(template="plotly_dark", margin=dict(t=50, l=25, r=25, b=25))
+    fig.update_layout(
+        title=f"🌐 {domain} SEO 流量架构 1:1 透视拓扑图 (已与底层目录树完美对齐)",
+        template="plotly_dark",
+        margin=dict(t=60, l=10, r=10, b=10)
+    )
     fig.write_html(output_html)
 
 
