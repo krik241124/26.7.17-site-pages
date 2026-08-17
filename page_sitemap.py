@@ -355,7 +355,13 @@ def generate_dashboard(merged_df, domain, tree_data):
 
 
 
-def generate_html_tree(node_dict, node_name=None, progress=None, level=0):
+def generate_html_tree(node_dict, node_name=None, progress=None, level=0, out_list=None):
+    # ✅ 核心优化：利用 out_list 收集所有 HTML 碎片，彻底避免字符串 += 带来的指数级内存复制
+    is_root = False
+    if out_list is None:
+        out_list = []
+        is_root = True
+
     if progress is None:
         progress = {"count": 0}
 
@@ -364,9 +370,15 @@ def generate_html_tree(node_dict, node_name=None, progress=None, level=0):
         logger.info(f"   👉 网页渲染进度: 绝对没卡死！已生成 {progress['count']} 个树形节点的 HTML 代码...")
 
     if node_name is None:
-        html = "<ul class='tree' id='seo-tree'>"
-        for k, v in node_dict.items(): html += generate_html_tree(v, k, progress, level=1)
-        return html + "</ul>"
+        out_list.append("<ul class='tree' id='seo-tree'>")
+        for k, v in node_dict.items(): 
+            generate_html_tree(v, k, progress, level=1, out_list=out_list)
+        out_list.append("</ul>")
+        
+        # 只有在最顶层（根节点）才执行最终的拼接
+        if is_root:
+            return "".join(out_list)
+        return
 
     data = node_dict.get('__data__')
     children = node_dict.get('__children__', {})
@@ -393,10 +405,10 @@ def generate_html_tree(node_dict, node_name=None, progress=None, level=0):
     else:
         label += f" <span style='color:#747d8c; font-size:12px;'>[流量: 0]</span>"
 
-    html = "<li>"
+    out_list.append("<li>")
     if children:
         # ✅ 去掉了 open 属性，改为注入等级属性供 JS 控制（彻底防崩溃）
-        html += f"<details data-level='{level}' data-traffic='{total_traffic}'><summary>{label}</summary><ul>"
+        out_list.append(f"<details data-level='{level}' data-traffic='{total_traffic}'><summary>{label}</summary><ul>")
         keys = list(children.keys())
         
         traffic_keys = [k for k in keys if children[k].get('__total_traffic__', 0) > 0]
@@ -406,17 +418,23 @@ def generate_html_tree(node_dict, node_name=None, progress=None, level=0):
         display_keys = traffic_keys + zero_keys[:MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE]
         hidden_keys = zero_keys[MAX_ZOMBIE_PAGES_PER_DIR_IN_TREE:]
         
-        for k in display_keys: html += generate_html_tree(children[k], k, progress, level + 1)
+        for k in display_keys: 
+            generate_html_tree(children[k], k, progress, level + 1, out_list)
         
         if hidden_keys:
-            html += f"<li><details data-level='{level+1}' data-traffic='0' name='zombie_accordion'><summary style='color:#a4b0be; font-size:12px; cursor:pointer;'>... (点击展开其他 {len(hidden_keys)} 个无流量页面)</summary><ul>"
-            for k in hidden_keys: html += generate_html_tree(children[k], k, progress, level + 2)
-            html += "</ul></details></li>"
+            out_list.append(f"<li><details data-level='{level+1}' data-traffic='0' name='zombie_accordion'><summary style='color:#a4b0be; font-size:12px; cursor:pointer;'>... (点击展开其他 {len(hidden_keys)} 个无流量页面)</summary><ul>")
+            for k in hidden_keys: 
+                generate_html_tree(children[k], k, progress, level + 2, out_list)
+            out_list.append("</ul></details></li>")
             
-        html += "</ul></details>"
+        out_list.append("</ul></details>")
     else:
-        html += f"<div style='padding-left: 20px;'>{label}</div>"
-    return html + "</li>"
+        out_list.append(f"<div style='padding-left: 20px;'>{label}</div>")
+    out_list.append("</li>")
+
+    # 如果是人为指定节点的起始调用，也需在此触发合并
+    if is_root:
+        return "".join(out_list)
 
 # ================= 6. 主控模块 =================
 def main():
